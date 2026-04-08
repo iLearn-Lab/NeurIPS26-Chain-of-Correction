@@ -1,0 +1,22 @@
+model:
+  path: "/home/zxn/MomaGraph-R1"
+  max_seq_len: 4096
+  use_flash_attention: true
+  gradient_checkpointing: true  
+
+data:
+  root_path: "/data/colosseum_dataset/expert"
+  sft_split: "expert"
+  sft_max_samples: 50000
+  num_workers: 8           # 每个 DDP 进程开启 8 个线程读图
+  prefetch_factor: 2       # 预加载 2 倍的数据到内存
+
+training:
+  max_grad_norm: 1.0       # 梯度剪裁阈值
+  sft:
+    epochs: 4
+    # max_steps: 10000       # 训练总步数
+    batch_size: 1          # 每张 A100 放 1 个样本 (取决于显存)
+    learning_rate: 2e-5    # 初始学习率
+    warmup_steps: 1500      # 预热步数
+    grad_accumulation_steps: 32  # 总 Batch Size = 8 * 1 * 32 = 256
