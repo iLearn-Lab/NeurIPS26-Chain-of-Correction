@@ -1,7 +1,9 @@
 # 绝对不要同步的系统和工具目录
 anaconda3/
 cuda-12.1-toolkit/
-
+*.tar.xz
+*.zip
+*.gz
 # 屏蔽所有大型权重文件（.pt, .bin, .safetensors, .pth）
 *.pt
 *.bin
@@ -61,3 +63,5 @@ wandb/
 *.pt
 *.safetensors
 /data/*
+policy/BridgeVLA/checkpoints/
+policy/BridgeVLA/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz
