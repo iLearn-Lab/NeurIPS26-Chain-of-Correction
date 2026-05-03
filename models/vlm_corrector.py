@@ -9,33 +9,51 @@ from io import BytesIO
 
 
 class VLMCorrector:
-    # 接收 eval.py 传来的所有参数，但统统忽略（因为真正的模型在 server 端）
+    """
+    Client-side interface for the Vision-Language Model (VLM) correction server.
+    This class handles image encoding and network communication with a remote 
+    VLM server that performs action correction via Chain-of-Thought (CoT).
+    """
     def __init__(self, *args, **kwargs):
-        # self.server_url = "http://127.0.0.1:5050"
+        """
+        Initializes the VLM Client.
+        
+        Args:
+            check_freq (int): Frequency of interventions (e.g., 5 means query every 5 steps).
+        """
         vlm_port = os.environ.get("VLM_PORT", "5050")
         self.server_url = f"http://127.0.0.1:{vlm_port}"
         
-        # 频率锁：避免每帧都做网络请求导致环境卡顿。现在设定为每 5 帧干预一次。
+        # Frequency lock: avoids network overhead by limiting server queries.
         self.check_freq = 1 
         
-        print(f"📡 [Client] VLM 客户端已启动！") 
+        print(f"[VLM Client] Initializing...") 
         
-        # 尝试联通测试并重置服务端记忆
+        # Connection test and initial memory reset
         try:
             requests.post(f"{self.server_url}/reset", timeout=5)
-            print(f"✅ [Client] 已联通 Server: {self.server_url}")
-        except Exception as e:
-            print(f"⚠️ [Client] 无法连接到 VLM 服务器，请检查服务端是否运行。")
+            print(f"[VLM Client] Connected to server at: {self.server_url}")
+        except Exception:
+            print(f"[VLM Client] Warning: Unable to reach VLM server. Ensure the backend is running.")
 
     def reset_memory(self):
-        """通知服务端清空上一集的对话记忆"""
+        """Notifies the server to clear conversation history for a new episode."""
         try:
             requests.post(f"{self.server_url}/reset", timeout=5)
         except Exception:
             pass
 
     def _array_to_b64(self, img_array):
-        """将仿真器传来的 Numpy 数组转为 Base64 字符串，使用 JPEG 极致压缩提速"""
+        """
+        Converts a NumPy image array into a Base64 string with JPEG compression.
+        
+        Args:
+            img_array (np.ndarray): Image array from the simulator.
+            
+        Returns:
+            str: Base64 encoded JPEG string.
+        """
+        # Convert float normalized images (0-1) to uint8 (0-255)
         if img_array.dtype == np.float32 or img_array.dtype == np.float64:
             img_array = (img_array * 255).astype(np.uint8)
         if len(img_array.shape) == 3 and img_array.shape[0] in [1, 3, 4]:
@@ -47,14 +65,26 @@ class VLMCorrector:
         return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
     def step(self, current_images, base_policy_proposal, time_step, instruction):
-        # 统一转为 float64 列表以便 JSON 序列化
+        """
+        Executes a single environment step. Queries the VLM if the frequency lock allows.
+        
+        Args:
+            current_images (list): List of camera observations (NumPy arrays).
+            base_policy_proposal (np.ndarray): The raw action proposed by the base policy.
+            time_step (int): Current episode step index.
+            instruction (str): Natural language task instruction.
+            
+        Returns:
+            tuple: (action_to_execute, is_correction_needed)
+        """
+        # Normalize to list of floats for JSON compatibility
         base_proposal_list = [round(float(v), 6) for v in base_policy_proposal]
         
-        # 频率锁生效：如果不是整数倍帧，直接丝滑返回基础动作，不打扰物理仿真
+        # Frequency lock: Return base action immediately if not an intervention frame
         if time_step != 0 and time_step % self.check_freq != 0:
             return base_proposal_list, False
 
-        # 到了触发干预的帧，打包图片和数据发送给 Server
+        # Prepare multimodal payload
         images_b64 = [self._array_to_b64(img) for img in current_images]
         
         payload = {
@@ -65,23 +95,16 @@ class VLMCorrector:
         }
         
         try:
-            # 向独立运行的大脑发送请求
+            # POST request to the VLM reasoning engine
             response = requests.post(f"{self.server_url}/step", json=payload, timeout=120)
             response.raise_for_status()
             result = response.json()
             
-            # 打印服务端传回来的 CoT 思维链（可选）
-            # cot = result.get('cot', '')
-            # if cot:
-            #     print(f"\n🧠 [VLM 思维链 t={time_step}] \n{cot}\n")
+            # Extract correction results
             corrected_action = result.get("corrected_action", base_proposal_list)[:8]
- 
-            # # 判定是否真正干预
-            # # 逻辑：如果返回的动作和原动作不同，或者服务端明确标记了需要纠错
-            # # 这里依赖服务端返回的推理结果
+
             # is_correction_needed = False
             # try:
-            #     # 再次解析 CoT 以提取 correction_needed 标志位
             #     json_match = re.search(r'```json\n(.*?)\n```', cot, re.DOTALL)
             #     if json_match:
             #         parsed = json.loads(json_match.group(1))
@@ -92,5 +115,5 @@ class VLMCorrector:
             return corrected_action, is_correction_needed
             
         except Exception as e:
-            print(f"❌ [Client] VLM 服务调用失败: {e}")
+            print(f"[VLM Client] Error calling VLM server: {e}")
             return base_proposal_list, False

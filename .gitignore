@@ -1,67 +1,38 @@
-# 绝对不要同步的系统和工具目录
 anaconda3/
 cuda-12.1-toolkit/
 *.tar.xz
 *.zip
 *.gz
-# 屏蔽所有大型权重文件（.pt, .bin, .safetensors, .pth）
+
+
 *.pt
 *.bin
 *.safetensors
 *.pth
 paligemma_base/
 
-# 屏蔽数据文件（仿真产生的轨迹和 HDF5）
+
 *.hdf5
 *.pkl
 data/
 /data/*
 
-# 屏蔽实验日志（这些会让 Git 历史变得臃肿）
+
 logs/
 *.log
 
-# 屏蔽 Python 缓存
+
 __pycache__/
 *.pyc
 
-# 屏蔽软连接指向的真实内容
-# 如果你在项目里创建了指向 /data 的软连接，Git 通常只传链接
-# 但为了保险，我们可以显式排除
-mllama/
-# === 系统与环境 ===
-anaconda3/
-cuda-12.1-toolkit/
 
-# === 模型权重 (屏蔽所有大型二进制文件) ===
-*.pt
-*.bin
-*.safetensors
-*.pth
-paligemma_base/
-
-# === 屏蔽软连接指向的真实内容 ===
-# 显式排除项目中的软连接目录
 mllama/
 vlm/llama-recipes/mllama/
 
-# === 数据集与中间文件 (仿真轨迹/HDF5) ===
-*.hdf5
-*.pkl
-data/
-/data/*
 
-# === 日志、缓存与临时文件 ===
-logs/
-*.log
-__pycache__/
-*.pyc
 .nfs*
 .DS_Store
 wandb/
 *.whl
-*.pt
-*.safetensors
-/data/*
 policy/BridgeVLA/checkpoints/
 policy/BridgeVLA/finetune/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04.tar.xz

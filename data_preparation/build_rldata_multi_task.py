@@ -44,7 +44,7 @@ def load_and_parse_json(json_path):
         is_correction = '"correction_needed": true' in assistant_content.lower()
         
         img_paths = item.get('image_paths', [])
-        num_images = len(img_paths)
+        # num_images = len(img_paths)
         
         try:
             parts = img_paths[0].split('/')
@@ -57,25 +57,35 @@ def load_and_parse_json(json_path):
             error_count += 1
 
         prompt_messages = messages[:-1]
-        prompt_str = ""
+        # prompt_str = ""
+        history_elements = []
         
-        if num_images > 0:
-            prompt_str += "<image>\n" * num_images
+        # if num_images > 0:
+        #     prompt_str += "<image>\n" * num_images
             
         for m in prompt_messages:
-            role = "User" if m['role'] == 'user' else "Assistant"
+        #     role = "User" if m['role'] == 'user' else "Assistant"
             content = m['content']
             if isinstance(content, list):
-                texts = [part['text'] for part in content if part.get('type') == 'text' and part.get('text')]
-                content = "\n".join(texts)
+                content = "\n".join([part['text'] for part in content if part.get('type') == 'text'])
+        #         texts = [part['text'] for part in content if part.get('type') == 'text' and part.get('text')]
+        #         content = "\n".join(texts)
             
-            content = str(content).replace('<image>\n', '').replace('<image>', '').strip()
-            prompt_str += f"[{role}]: {content}\n\n"
+        #     content = str(content).replace('<image>\n', '').replace('<image>', '').strip()
+        #     prompt_str += f"[{role}]: {content}\n\n"
             
-        prompt_str += "[Assistant]: "
-      
+        # prompt_str += "[Assistant]: "  
+            clean_content = str(content).replace('<image>\n', '').replace('<image>', '').strip()
+             
+            history_elements.append(clean_content)
+ 
+        num_images = len(img_paths)
+        image_placeholders = "<image>\n" * num_images
+
+        full_problem = image_placeholders + "\n\n".join(history_elements)
+
         rl_data.append({
-            "problem": prompt_str,
+            "problem": full_problem,
             "images": img_paths,
             "answer": assistant_content,
             "extra_info": {
@@ -86,6 +96,18 @@ def load_and_parse_json(json_path):
                 "is_correction_sample": is_correction
             }
         })
+        # rl_data.append({
+        #     "problem": prompt_str,
+        #     "images": img_paths,
+        #     "answer": assistant_content,
+            # "extra_info": {
+            #     "task": task_name,
+            #     "episode_id": ep_id,
+            #     "frame_id": frame_id,
+            #     "baseline_progress": 0.0,
+            #     "is_correction_sample": is_correction
+            # }
+        # })
         
     print(f"Extraction complete. Total samples: {len(rl_data)}, Errors: {error_count}")
     return pd.DataFrame(rl_data)

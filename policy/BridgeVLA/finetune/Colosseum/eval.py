@@ -171,7 +171,7 @@ def eval(
     log_dir=None,
     verbose=True,
     save_video=False, 
-    save_failed=True,          # <--- 新增参数，默认保存失败轨迹
+    save_failed=True,           
 ):
     agent.eval()
     if isinstance(agent, bridgevla_agent.RVTAgent):
@@ -181,7 +181,7 @@ def eval(
     obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
 
     # ==========================================
-    #  强制 RLBench 在评测时计算并返回所有低维物理状态
+    # Force RLBench to calculate and return all low-dimensional physical states during evaluation
     # ==========================================
     if save_failed:
         obs_config.joint_velocities = True
@@ -256,7 +256,7 @@ def eval(
     stats_accumulator = SimpleAccumulator(eval_video_fps=30)
     vlm_corrector = VLMCorrector(
         model_path="/data/colosseum_dataset/checkpoints/sft/v1/checkpoint-epoch-1",
-        base_model_path="/home/zxn/MomaGraph-R1",   # 与训练时 config.model.path 一致
+        base_model_path="/home/zxn/MomaGraph-R1",  
         device="cuda:4"
     )
     # vlm_corrector = None
@@ -291,12 +291,13 @@ def eval(
                 step_idx = 0
                 for replay_transition in generator:
                     if verbose:
-                        print(f"   step {step_idx}: VLM corrected action = {replay_transition.action[:8]}")  # 只打印前8维
+                        print(f"   step {step_idx}: VLM corrected action = {replay_transition.action[:8]}")   
                     step_idx += 1
                     if save_failed:
-                        # 从环境里把刚才挂载的原始观测拿出来
+                        # Extract the uncorrupted raw observation instance previously mounted from the environment
                         pure_obs = copy.deepcopy(eval_env.latest_raw_obs)
-                        # 给这个干净的对象打上动作
+                        
+                        # Assign the current action to this clean observation instance
                         pure_obs.action = replay_transition.action
                         if not isinstance(replay_transition.info, dict):
                             replay_transition.info = {}
@@ -326,20 +327,19 @@ def eval(
                     f"Evaluating {task_name} | Episode {ep} | Total Episode {total_count} |Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}"
                 )
             # ==========================================
-            #  自动收集失败的 Demo 数据
+            # Automatically collect data from failed demonstration trajectories
             # ==========================================
-            # 判定条件：根据脚本底部的保存视频逻辑，reward <= 99 视为失败
+            # Evaluation criteria: Based on the video saving logic at the bottom of the script, 
+            # a reward <= 99 is considered a failure.
             if reward <= 99 and save_failed:
                 try:
                     current_task_base = task_class_base[task_id]
                     current_variation = task_class_variation_idx[task_id]
-                    
-                    # 从每帧的 info 字典里，把包含 Action 的完美观测挖出来
+                     
                     pure_obs_history = [t.info['pure_rlbench_obs'] for t in episode_rollout]
-                    
-                    # 传给收集脚本
+                     
                     save_failed_episode(
-                        transitions=pure_obs_history,  # <--- 现在传的是纯净对象的列表
+                        transitions=pure_obs_history,   
                         task_name=current_task_base,
                         variation=current_variation,
                         episode_id=ep,
@@ -347,7 +347,7 @@ def eval(
                         base_dir="/data/colosseum_dataset/failed_eval_demos"
                     )
                 except Exception as e:
-                    print(f"⚠️ 保存失败轨迹时出错: {e}")
+                    print(f"[Error] Failed to save the trajectory: {e}")
             # ==========================================
 
         # report summaries

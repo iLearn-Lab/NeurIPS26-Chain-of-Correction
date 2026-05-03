@@ -11,6 +11,7 @@ Implements supervised fine-tuning for Qwen2.5-VL with:
 
 import os
 import logging
+import glob
 from typing import Dict, List, Any, Optional 
 import bitsandbytes as bnb
 
@@ -87,7 +88,7 @@ class SFTTrainer:
             drop_last=True,
         )
 
-        # 动态计算总步数 
+        # Calculate training step budget
         batches_per_epoch = len(self.dataloader)
         self.total_global_steps = batches_per_epoch * self.epochs
         self.total_optim_steps = self.total_global_steps // self.grad_accumulation_steps
@@ -159,21 +160,20 @@ class SFTTrainer:
         from PIL import Image
 
         for sample in raw_batch:
-            images = sample["images"]  # 这是一个路径字符串列表
+            images = sample["images"]
             prompt = sample["prompt"]
             ground_truth = sample["ground_truth"]
 
-            # ================= 添加的图像读取逻辑 =================
+            # Load and convert images to RGB
             pil_images = []
             for img_path in images:
                 try:
                     pil_images.append(Image.open(img_path).convert("RGB"))
                 except Exception as e:
-                    logger.error(f"无法读取图片 {img_path}: {e}")
+                    logger.error(f"Image load failed for {img_path}: {e}")
             all_images.append(pil_images)
-            # ====================================================== 
 
-            # -- full conversation (prompt + assistant response) --
+            # Construct Full Conversation (Prompt + Response)
             full_msgs = list(prompt) + [
                 {"role": "assistant", "content": ground_truth}
             ]
@@ -200,27 +200,17 @@ class SFTTrainer:
             max_length=self.config.model.max_seq_len,
         )
 
-        # =====================================================================
-        #  对齐检查：仅在第一步打印第一条样本的全链路数据流
-        # =====================================================================
+        # First-step data flow inspection (Master rank only)
         if self.global_step == 0 and is_main_process():
-            logger.info("\n" + "▼"*60)
-            logger.info("🚦 [TRAIN 对齐核查] 首条样本的全链路数据流拆解")
-            logger.info("▼"*60)
-            
-            # 1. 检查图片是否被正常读取为 PIL 对象
-            num_imgs = len(all_images[0]) if all_images and len(all_images) > 0 else 0
-            logger.info(f"▶ [1. 物理图片]: 成功读取了 {num_imgs} 张 PIL.Image 对象")
-            
-            # 2. 检查应用 Chat Template 后的纯文本（看看历史还有没有残留的 <image>）
-            logger.info(f"\n▶ [2. 应用 Template 后的文本 (full_texts[0])]:\n{full_texts[0]}")
-            
-            # 3. 最关键的一步！把 input_ids 解码回人类可读文本，看看模型底层到底看到了什么
-            # 注意：这里 skip_special_tokens=False，为了暴露出所有的视觉占位符
+            logger.info("\n" + "▼" * 60)
+            logger.info("TRAINING PIPELINE AUDIT: First Sample Analysis")
+            logger.info("▼" * 60)
+            num_imgs = len(all_images[0]) if all_images else 0
+            logger.info(f"Step 1: Loaded {num_imgs} PIL.Image objects.")
+            logger.info(f"Step 2: Template applied. Raw text preview:\n{full_texts[0][:500]}...")
             decoded_ids = self.processor.tokenizer.decode(inputs['input_ids'][0], skip_special_tokens=False)
-            logger.info(f"\n▶ [3. 模型底层的真实 Input Tokens (关注 <|image_pad|> 的位置)]:\n{decoded_ids}")
-            
-            logger.info("▲"*60 + "\n")
+            logger.info(f"Step 3: Decoded Input IDs (Visual padding markers included):\n{decoded_ids[:1000]}...")
+            logger.info("▲" * 60 + "\n")
         # =====================================================================
  
         if self.global_step == 0 and is_main_process():
@@ -230,7 +220,7 @@ class SFTTrainer:
             tokens = self.processor.tokenizer.convert_ids_to_tokens(inputs['input_ids'][0][:20])
             logger.info(f"- First 20 Tokens: {tokens}")
 
-        # 使用完整的 processor (含图像) 来计算 Prompt 的真实长度
+        # Calculate accurate prompt lengths (accounting for visual tokens)
         prompt_inputs = self.processor(
             text=prompt_texts,
             images=all_images if any(all_images) else None,
@@ -239,29 +229,25 @@ class SFTTrainer:
             truncation=True,
             max_length=self.config.model.max_seq_len,
         )
-        
-        # 通过 attention_mask 求和来获取每个 prompt 的准确 token 数量
+         
         prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
 
         # Build labels: -100 for prompt tokens and padding
         labels = inputs["input_ids"].clone()
         for i, plen in enumerate(prompt_lengths):
-            # 确保只 mask 掉真正的 prompt 长度
             labels[i, :plen] = -100
         if "attention_mask" in inputs:
             labels[inputs["attention_mask"] == 0] = -100
 
         inputs["labels"] = labels
-
-        # 仅在主进程的第 0 步打印前 2 条样本的掩码情况
+ 
         if get_rank() == 0 and self.global_step == 0:
             for i in range(min(2, len(raw_batch))):
                 ids = inputs["input_ids"][i]
                 lbs = labels[i]
                 tokens = self.processor.tokenizer.convert_ids_to_tokens(ids)
                 debug_str = f"\n--- Sample {i} Masking Check ---"
-                for t, l in zip(tokens, lbs):
-                    # 绿色表示计算 Loss，红色表示被屏蔽
+                for t, l in zip(tokens, lbs): 
                     color = "\033[92m" if l != -100 else "\033[91m"
                     debug_str += f"{color}{t}\033[0m "
                 print(debug_str + "\n") 
@@ -271,8 +257,47 @@ class SFTTrainer:
     # Training loop
     # ------------------------------------------------------------------
 
-    def train(self) -> Optional[str]:
+    def train(self, resume_from_checkpoint: Optional[str] = None) -> Optional[str]:
         """Run the full SFT training loop.  Returns final checkpoint path."""
+
+        # Handle training resumption logic
+        if resume_from_checkpoint:
+            checkpoint_path = None
+            if resume_from_checkpoint.lower() == "true":
+                checkpoints = glob.glob(os.path.join(self.output_dir, "checkpoint-*"))
+                checkpoints = [c for c in checkpoints if c.split('-')[-1].isdigit()]
+                if checkpoints:
+                    checkpoint_path = max(checkpoints, key=lambda x: int(x.split('-')[-1]))
+            else:
+                checkpoint_path = resume_from_checkpoint
+
+            if checkpoint_path and os.path.exists(checkpoint_path):
+                if is_main_process():
+                    logger.info(f"Resuming training from checkpoint: {checkpoint_path}")
+                 
+                model_to_load = self.model.module if hasattr(self.model, "module") else self.model
+                 
+                state_dict_path = os.path.join(checkpoint_path, "pytorch_model.bin")
+                if not os.path.exists(state_dict_path): 
+                     state_dict_path = os.path.join(checkpoint_path, "model.safetensors")
+                 
+                state_path = os.path.join(checkpoint_path, "trainer_state.pt")
+                if os.path.exists(state_path): 
+                    state = torch.load(state_path, map_location="cpu", weights_only=False)
+                    self.optimizer.load_state_dict(state["optimizer"])
+                    self.scheduler.load_state_dict(state["scheduler"])
+                    self.global_step = state["global_step"]
+                    self.optimizer_step = state["optim_step"]
+                    del state
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache() 
+                     
+            else:
+                if is_main_process():
+                    logger.warning(f"{resume_from_checkpoint} not found.")
+
+
         self.model.train()
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -282,7 +307,7 @@ class SFTTrainer:
         for epoch in range(self.epochs):
             if is_main_process():
                 logger.info(f"\n=======================================================")
-                logger.info(f"🚀 STARTING EPOCH {epoch + 1} / {self.epochs}")
+                logger.info(f" STARTING EPOCH {epoch + 1} / {self.epochs}")
                 logger.info(f"=======================================================\n")
  
             if isinstance(self.dataloader.sampler, DistributedSampler):
@@ -335,19 +360,16 @@ class SFTTrainer:
                     accum_loss = 0.0
 
                 self.global_step += 1
-
-                # 每 500 步保存一次 Checkpoint
+ 
                 if self.global_step > 0 and self.global_step % 500 == 0:
                     self._save_checkpoint(
                         os.path.join(self.output_dir, f"checkpoint-{self.global_step}")
                     )
-
-            # 在每个 Epoch 结束时，额外存一个带有 Epoch 标记的 Checkpoint
+ 
             self._save_checkpoint(
                 os.path.join(self.output_dir, f"checkpoint-epoch-{epoch + 1}")
             )
-
-        # 所有 Epoch 跑完后保存最终模型
+ 
         final = os.path.join(self.output_dir, "checkpoint-final")
         self._save_checkpoint(final)
         return final
@@ -360,23 +382,18 @@ class SFTTrainer:
     def _save_checkpoint(self, path: str) -> None:
         if not is_main_process():
             return
-        
-        # 把 path 当作一个文件夹来创建
+         
         os.makedirs(path, exist_ok=True)
-        
-        # 剥离 DDP 的 wrapper 获取最原始的模型
+         
         model_to_save = self.model.module if hasattr(self.model, "module") else self.model
-        
-        # 使用 Hugging Face 原生的 save_pretrained，这样你可以直接从这个目录 load 模型
+         
         if hasattr(model_to_save, "save_pretrained"):
-            model_to_save.save_pretrained(path)
-            # 顺便把 processor (Tokenizer 和 ImageProcessor) 也存下来
+            model_to_save.save_pretrained(path) 
             if hasattr(self, "processor") and self.processor:
                 self.processor.save_pretrained(path)
         else:
             torch.save(model_to_save.state_dict(), os.path.join(path, "pytorch_model.bin"))
-            
-        # 保存训练状态，防止中断后要断点续训
+             
         state = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),

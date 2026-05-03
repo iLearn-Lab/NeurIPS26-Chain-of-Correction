@@ -29,7 +29,6 @@ def convert_prompt_to_qwen_messages(
     """Convert VERL-style chat messages to Qwen2.5-VL structured format."""
     converted: List[Dict[str, Any]] = []
 
-    # 找到最后一个 user 消息的索引
     last_user_idx = -1
     for i in range(len(prompt_messages) - 1, -1, -1):
         if prompt_messages[i]["role"] == "user":
@@ -41,13 +40,11 @@ def convert_prompt_to_qwen_messages(
         content = msg["content"]
 
         if isinstance(content, str) and "<image>" in content:
-            # 如果不是最后一轮对话，直接把历史轮次里的 <image> 及其换行符删掉
             if i != last_user_idx:
                 cleaned_content = content.replace("<image>\n", "").replace("<image>", "")
                 converted.append({"role": role, "content": cleaned_content})
                 continue
 
-            # 如果是最后一轮（当前观测），则进行正常的切分并转换为 dict 格式
             parts = content.split("<image>")
             blocks: List[Dict[str, Any]] = []
             for j, part in enumerate(parts):

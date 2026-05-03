@@ -1,110 +1,426 @@
 import os
+import yaml
+import csv
 import torch
+import cv2
+import shutil
 import numpy as np
+from omegaconf import OmegaConf
+from multiprocessing import Value
 import copy
-from collections import deque
-from termcolor import cprint
+from copy import deepcopy
  
-from eval import load_agent 
-from utils.custom_rlbench_env import CustomMultiTaskRLBenchEnv2 as CustomMultiTaskRLBenchEnv
-from utils.peract_utils_colosseum import CAMERAS, IMAGE_SIZE
-from bridgevla.libs.peract.helpers import utils
+import requests
+import json
+import base64
+from io import BytesIO
+from PIL import Image
+from termcolor import cprint
+# -------------------------
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ["BITSANDBYTES_NOWELCOME"] = "1"
+from collect_failure_cases import save_failed_episode
+from models.vlm_corrector import VLMCorrector
+
+from rlbench.backend import task as rlbench_task
+from rlbench.backend.utils import task_file_to_task_class
 from rlbench.action_modes.gripper_action_modes import Discrete
 from rlbench.action_modes.action_mode import MoveArmThenGripper
+from yarr.utils.rollout_generator import RolloutGenerator
+from yarr.utils.stat_accumulator import SimpleAccumulator
+from yarr.utils.log_writer import LogWriter
+from yarr.agents.agent import VideoSummary, ActResult
+
+import bridgevla.mvt.config as default_mvt_cfg
+import bridgevla.models.bridgevla_agent as bridgevla_agent
+import bridgevla.config as default_exp_cfg
+
+from bridgevla.mvt.mvt import MVT
+from bridgevla.libs.peract.helpers import utils
+from utils.custom_rlbench_env import CustomMultiTaskRLBenchEnv2 as CustomMultiTaskRLBenchEnv
+from utils.peract_utils_colosseum import CAMERAS, SCENE_BOUNDS, IMAGE_SIZE, get_official_peract
 from utils.rlbench_planning import EndEffectorPoseViaPlanning2 as EndEffectorPoseViaPlanning
-from bridgevla.utils.rvt_utils import get_eval_parser, name_to_class, COLOSSEUM_TASKS, TASKS_PY_FOLDER
+from bridgevla.utils.rvt_utils import TensorboardManager, get_eval_parser, COLOSSEUM_TASKS
+from bridgevla.utils.rvt_utils import load_agent as load_agent_state
+
+from colosseum import ASSETS_CONFIGS_FOLDER, ASSETS_JSON_FOLDER, TASKS_PY_FOLDER, TASKS_TTM_FOLDER
+from colosseum.rlbench.utils import ObservationConfigExt, check_and_make, name_to_class, save_demo
  
-from llama_recipes.models.mllama_model import MllamaForConditionalGenerationWM, MllamaWMProcessor
-
 class ForewarnRanker:
-    """FOREWARN 潜空间动作筛选器"""
-    def __init__(self, task_name, vlm_path, wm_path, device, num_candidates=8):
-        self.device = device
-        self.num_candidates = num_candidates
-        cprint(f"--- Loading FOREWARN Ranker for {task_name} ---", "magenta")
+    def __init__(self, host="localhost", port=6060):
+        self.url = f"http://{host}:{port}"
+        cprint(f"Connected to FOREWARN server: {self.url}", "cyan")
+
+    def rank_actions(self, raw_obs, candidates, lang_goal, step_idx):
+        images_b64 = []
+        for cam in ['front', 'left_shoulder', 'right_shoulder', 'wrist']:
+            img_key = f"{cam}_rgb"
+            if hasattr(raw_obs, img_key):
+                img_array = getattr(raw_obs, img_key)
+                pil_img = Image.fromarray(img_array)
+                buffered = BytesIO()
+                pil_img.save(buffered, format="JPEG")
+                images_b64.append(base64.b64encode(buffered.getvalue()).decode("utf-8"))
+
+        low_dim_state = getattr(raw_obs, 'task_low_dim_state', [])
+        if isinstance(low_dim_state, np.ndarray):
+            low_dim_state = low_dim_state.tolist()
+
+        payload = {
+            "instruction": lang_goal,
+            "candidates": [c.tolist() if isinstance(c, np.ndarray) else c for c in candidates],
+            "images_b64": images_b64,
+            "time_step": step_idx,
+            "state": low_dim_state
+        }
+
+        try:
+            response = requests.post(f"{self.url}/rank", json=payload, timeout=30)
+            best_idx = response.json().get("best_action_idx", 0)
+            cprint(f"   [FOREWARN Decision] Step {step_idx}: Picked Candidate {best_idx}", "magenta")
+            return best_idx
+        except Exception as e:
+            cprint(f" FOREWARN server connection failure: {e}, back to 0", "red")
+            return 0 
+
+    def reset(self):
+        try:
+            requests.post(f"{self.url}/reset", timeout=5)
+        except:
+            pass
+
+class ForewarnAgentWrapper: 
+    def __init__(self, agent, ranker, env):
+        self.agent = agent
+        self.ranker = ranker
+        self.env = env
+        self.step_counter = 0
         
-        # 1. 加载微调后的 Llama-WM (包含已训练好的 Projector)
-        self.model = MllamaForConditionalGenerationWM.from_pretrained(
-            vlm_path, torch_dtype=torch.bfloat16, device_map=device
+        self.agent.use_sampling = True
+        self.agent.num_samples = 8
+        self.agent.sampling_temp = 0.1
+
+    def act(self, step, obs, **kwargs): 
+        raw_act_result = self.agent.act(step, obs, **kwargs)
+         
+        candidates = []
+        if isinstance(raw_act_result, list):
+            for res in raw_act_result: 
+                candidates.append(res if isinstance(res, np.ndarray) else res.action)
+        else:
+            candidates.append(raw_act_result if isinstance(raw_act_result, np.ndarray) else raw_act_result.action)
+         
+        raw_obs = self.env.latest_raw_obs
+        lang_goal = self.env._lang_goal
+        
+        best_idx = self.ranker.rank_actions(raw_obs, candidates, lang_goal, self.step_counter)
+        self.step_counter += 1
+         
+        return ActResult(
+            action=candidates[best_idx],
+            observation_elements={},
+            replay_elements={},
+            info={}
         )
-        # 2. 内部初始化世界模型 (WM)
-        # 注意：initialize_vision_model 会读取 config 里的 wm_path
-        self.model.initialize_vision_model() 
-        self.model.eval()
-        
-        self.processor = MllamaWMProcessor.from_pretrained(vlm_path)
 
-    @torch.no_grad()
-    def rank_actions(self, history_obs, candidates, lang_goal):
-        """对候选动作进行潜空间打分"""
-        # 这里封装发送给 Llama 进行 Stage 2 选择的逻辑
-        # 简单起见，这里逻辑对应 llama_wm_infer.py 的生成过程
-        # 返回得分最高的 action 索引
-        return 0 # 占位符：实际逻辑需对接 model.generate 并解析 text 输出的 ID
+    def __getattr__(self, name):
+        return getattr(self.agent, name)
+# ==========================================
 
-def eval_forewarn(args):
-    # 1. 加载基础策略 (Base Policy, e.g., BridgeVLA)
-    base_agent = load_agent(
-        model_path=os.path.join(args.model_folder, args.model_name),
-        device=args.device
+def load_agent(model_path=None, exp_cfg_path=None, mvt_cfg_path=None, eval_log_dir="", device=0, use_input_place_with_mean=False):
+    device = f"cuda:{device}"
+    assert model_path is not None
+    model_folder = os.path.join(os.path.dirname(model_path))
+
+    exp_cfg = default_exp_cfg.get_cfg_defaults()
+    if exp_cfg_path != None:
+        exp_cfg.merge_from_file(exp_cfg_path)
+    else:
+        exp_cfg.merge_from_file(os.path.join(model_folder, "exp_cfg.yaml"))
+
+    if not use_input_place_with_mean:
+        old_place_with_mean = exp_cfg.rvt.place_with_mean
+        exp_cfg.rvt.place_with_mean = True
+
+    exp_cfg.freeze()
+
+    mvt_cfg = default_mvt_cfg.get_cfg_defaults()
+    if mvt_cfg_path != None:
+        mvt_cfg.merge_from_file(mvt_cfg_path)
+    else:
+        mvt_cfg.merge_from_file(os.path.join(model_folder, "mvt_cfg.yaml"))
+
+    mvt_cfg.freeze()
+
+    if mvt_cfg.stage_two:
+        exp_cfg.defrost()
+        exp_cfg.rvt.place_with_mean = old_place_with_mean
+        exp_cfg.freeze()
+
+    rvt = MVT(renderer_device=device, **mvt_cfg)
+
+    agent = bridgevla_agent.RVTAgent(
+        network=rvt.to(device),
+        image_resolution=[IMAGE_SIZE, IMAGE_SIZE],
+        stage_two=mvt_cfg.stage_two,
+        rot_ver=mvt_cfg.rot_ver,
+        scene_bounds=SCENE_BOUNDS,
+        cameras=CAMERAS,
+        log_dir=f"{eval_log_dir}/eval_run",
+        **exp_cfg.peract,
+        **exp_cfg.rvt,
     )
 
-    # 2. 环境初始化 (同原 eval.py)
+    agent.build(training=False, device=device)
+    load_agent_state(model_path, agent)
+    agent.eval()
+    print("Agent Information\n", agent)
+    return agent
+
+@torch.no_grad()
+def eval(agent, tasks, eval_datafolder, start_episode=0, eval_episodes=25, episode_length=25, replay_ground_truth=False, device=0, headless=True, logging=False, log_dir=None, verbose=True, save_video=False, save_failed=True):
+    agent.eval()
     camera_resolution = [IMAGE_SIZE, IMAGE_SIZE]
     obs_config = utils.create_obs_config(CAMERAS, camera_resolution, method_name="")
-    action_mode = MoveArmThenGripper(EndEffectorPoseViaPlanning(), Discrete())
+
+    if save_failed:
+        obs_config.joint_velocities = True
+        obs_config.joint_positions = True
+        obs_config.joint_forces = True
+        obs_config.gripper_open = True
+        obs_config.gripper_pose = True
+        obs_config.gripper_matrix = True
+        obs_config.gripper_joint_positions = True
+        obs_config.gripper_touch_forces = True
+        obs_config.task_low_dim_state = True
+
+    gripper_mode = Discrete()
+    arm_action_mode = EndEffectorPoseViaPlanning()
+    action_mode = MoveArmThenGripper(arm_action_mode, gripper_mode)
+
+    task_files = [t.replace(".py", "") for t in os.listdir(rlbench_task.TASKS_PATH) if t != "__init__.py" and t.endswith(".py")]
+    task_classes = []
+    if tasks[0] == "all":
+        tasks = COLOSSEUM_TASKS
     
-    # 3. 任务循环
-    tasks = args.tasks if args.tasks[0] != "all" else COLOSSEUM_TASKS
-    for task_name in tasks:
-        # 🌟 为每个任务初始化专用的 FOREWARN 打分器
-        # 路径需要根据你训练好的 VLM ckpt 动态调整
-        ranker = ForewarnRanker(
-            task_name=task_name,
-            vlm_path=f"/data/finetuned_models/Forewarn_VLMs/{task_name}_ckpt",
-            wm_path=f"logs/dreamer_cont/{task_name}/...", # 指向你正在练的模型
-            device=args.device
-        )
+    task_class_variation_idx = []
+    task_class_base = []
+    for task in tasks:
+        task_class_base.append('_'.join(task.split('_')[:-1]))
+        if task_class_base[-1] not in task_files:
+            raise ValueError('Task %s not recognised!.' % task)
+        task_class = name_to_class(task_class_base[-1], TASKS_PY_FOLDER)
+        task_class_variation_idx.append(int(task.split('_')[-1]))
+        task_classes.append(task_class)
 
-        env = CustomMultiTaskRLBenchEnv(
-            task_classes=[name_to_class('_'.join(task_name.split('_')[:-1]), TASKS_PY_FOLDER)],
-            observation_config=obs_config,
-            action_mode=action_mode,
-            dataset_root=args.eval_datafolder,
-            headless=args.headless,
-            device=args.device
-        )
-        env.launch()
+    eval_env = CustomMultiTaskRLBenchEnv(
+        task_classes=task_classes,
+        observation_config=obs_config,
+        action_mode=action_mode,
+        dataset_root=eval_datafolder,
+        episode_length=episode_length,
+        headless=headless,
+        swap_task_every=eval_episodes,
+        include_lang_goal_in_obs=True,
+        time_in_state=True,
+        record_every_n=1 if save_video else -1,
+        base_cfg_name=task_class_base,
+        task_class_variation_idx=task_class_variation_idx,
+    )
+    eval_env.eval = True
+    device = f"cuda:{device}"
 
-        for ep in range(args.eval_episodes):
-            obs = env.reset()
-            history_buffer = deque(maxlen=5) # 维护 5 帧历史
-            done = False
+    if logging:
+        assert log_dir is not None
+        csv_file = "eval_results.csv"
+        if not os.path.exists(os.path.join(log_dir, csv_file)):
+            with open(os.path.join(log_dir, csv_file), "w") as csv_fp:
+                fieldnames = ["task", "success rate", "length", "total_transitions"]
+                csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
+                csv_writer.writeheader()
+
+    rollout_generator = RolloutGenerator(device)
+    stats_accumulator = SimpleAccumulator(eval_video_fps=30)
+     
+    vlm_corrector = None 
+    ranker = ForewarnRanker(port=int(os.environ.get("VLM_PORT", 6060)))
+    wrapped_agent = ForewarnAgentWrapper(agent, ranker, eval_env)
+
+    eval_env.launch()
+    current_task_id = -1
+    num_tasks = len(tasks)
+    step_signal = Value("i", -1)
+    scores = []
+
+    for task_id in range(num_tasks):
+        task_rewards = []
+        language_goals=[]
+        total_count=0
+        for ep in range(start_episode, start_episode + eval_episodes):
+             
+            ranker.reset()
+            wrapped_agent.step_counter = 0
+
+            episode_rollout = [] 
+            generator = rollout_generator.generator(
+                step_signal=step_signal,
+                env=eval_env,
+                agent=wrapped_agent, 
+                episode_length=episode_length,
+                timesteps=1,
+                eval=True,
+                eval_demo_seed=ep,
+                record_enabled=False,
+                replay_ground_truth=replay_ground_truth,
+                vlm_corrector=vlm_corrector,
+            )
+            try:
+                step_idx = 0
+                for replay_transition in generator:
+                    if verbose:
+                        print(f"   step {step_idx}: Selected action = {replay_transition.action[:8]}")
+                    step_idx += 1
+                    if save_failed:
+                        pure_obs = copy.deepcopy(eval_env.latest_raw_obs)
+                        pure_obs.action = replay_transition.action
+                        if not isinstance(replay_transition.info, dict):
+                            replay_transition.info = {}
+                        replay_transition.info['pure_rlbench_obs'] = pure_obs
+                    episode_rollout.append(replay_transition)
+                total_count+=1
+            except StopIteration as e:
+                assert False
+                continue
+            except Exception as e:
+                eval_env.shutdown()
+                raise e
+
+            for transition in episode_rollout:
+                stats_accumulator.step(transition, True)
+                current_task_id = transition.info["active_task_id"]
+                assert current_task_id == task_id
+
+            task_name = tasks[task_id]
+            reward = episode_rollout[-1].reward
+            task_rewards.append(reward)
+            lang_goal = eval_env._lang_goal
+            language_goals.append(lang_goal)
+            if verbose:
+                print(f"Evaluating {task_name} | Episode {ep} | Total Episode {total_count} |Score: {reward} | Episode Length: {len(episode_rollout)} | Lang Goal: {lang_goal}")
             
-            while not done:
-                # A. 基础策略给出建议动作
-                base_action = base_agent.predict(obs) 
-                
-                # B. 生成扰动候选 (Action Proposals)
-                candidates = []
-                candidates.append(base_action)
-                for _ in range(ranker.num_candidates - 1):
-                    noise = np.random.normal(0, 0.05, size=base_action.shape)
-                    noise[-1] = 0 # 保持夹爪闭合状态离散性
-                    candidates.append(base_action + noise)
-                
-                # C. 潜空间打分选优 (FOREWARN Core)
-                # 使用 history_buffer 和 candidates 调用 ranker
-                best_action = ranker.rank_actions(history_buffer, candidates, env._lang_goal)
-                
-                # D. 环境步进
-                obs, reward, done, info = env.step(candidates[best_action])
-                history_buffer.append(obs)
-                
-            print(f"Task {task_name} Ep {ep} Success: {reward > 99}")
-        env.shutdown()
+            if reward <= 99 and save_failed:
+                try:
+                    current_task_base = task_class_base[task_id]
+                    current_variation = task_class_variation_idx[task_id]
+                    pure_obs_history = [t.info['pure_rlbench_obs'] for t in episode_rollout]
+                    save_failed_episode(
+                        transitions=pure_obs_history,
+                        task_name=current_task_base,
+                        variation=current_variation,
+                        episode_id=ep,
+                        descriptions=[lang_goal],
+                        base_dir="/data/colosseum_dataset/failed_eval_demos"
+                    )
+                except Exception as e:
+                    print(f" Fail to save failure rollouts: {e}")
+
+        summaries = []
+        summaries.extend(stats_accumulator.pop())
+        task_name = tasks[task_id]
+        if logging:
+            with open(os.path.join(log_dir, csv_file), "a") as csv_fp:
+                fieldnames = ["task", "success rate", "length", "total_transitions"]
+                csv_writer = csv.DictWriter(csv_fp, fieldnames=fieldnames)
+                csv_results = {"task": task_name}
+                for s in summaries:
+                    if s.name == "eval_envs/return":
+                        csv_results["success rate"] = s.value
+                    elif s.name == "eval_envs/length":
+                        csv_results["length"] = s.value
+                    elif s.name == "eval_envs/total_transitions":
+                        csv_results["total_transitions"] = s.value
+                    if "eval" in s.name:
+                        s.name = "%s/%s" % (s.name, task_name)
+                csv_writer.writerow(csv_results)
+        else:
+            for s in summaries:
+                if "eval" in s.name:
+                    s.name = "%s/%s" % (s.name, task_name)
+
+        if len(summaries) > 0:
+            task_score = [s.value for s in summaries if f"eval_envs/return/{task_name}" in s.name][0]
+        else:
+            task_score = "unknown"
+
+        print(f"[Evaluation] Finished {task_name} | Final Score: {task_score}\n")
+        scores.append(task_score)
+         
+
+    eval_env.shutdown()
+    if logging: csv_fp.close()
+    agent.train()
+    return scores
+
+def get_model_index(filename):
+    if len(filename) >= 9 and filename[-4:] == ".pth":
+        try: return int(filename[:-4].split("_")[-1])
+        except: return None
+    return None
+
+def _eval(args):
+    assert args.model_name is not None
+    model_path=os.path.join(args.model_folder, args.model_name)
+    tb = TensorboardManager(args.eval_log_dir)
+    tasks_to_eval = deepcopy(args.tasks)
+
+    model_idx = get_model_index(model_path)
+    if model_idx is None: model_idx = 0
+
+    agent = load_agent(
+        model_path=model_path,
+        exp_cfg_path=args.exp_cfg_path,
+        mvt_cfg_path=args.mvt_cfg_path,
+        eval_log_dir=args.eval_log_dir,
+        device=args.device,
+        use_input_place_with_mean=args.use_input_place_with_mean
+    )
+
+    agent_eval_log_dir = os.path.join(args.eval_log_dir, os.path.basename(model_path).split(".")[0])
+    os.makedirs(agent_eval_log_dir, exist_ok=True)
+    
+    scores = eval(
+        agent=agent,
+        tasks=tasks_to_eval,
+        eval_datafolder=args.eval_datafolder,
+        start_episode=args.start_episode,
+        eval_episodes=args.eval_episodes,
+        episode_length=args.episode_length,
+        replay_ground_truth=args.ground_truth,
+        device=args.device,
+        headless=args.headless,
+        logging=True,
+        log_dir=agent_eval_log_dir,
+        verbose=True,
+        save_video=args.save_video,
+        save_failed=args.save_failed,
+    )
+    print(f"model {model_path}, scores {scores}")
+    task_scores = {tasks_to_eval[i]: scores[i] for i in range(len(tasks_to_eval))}
+    tb.update("eval", model_idx, task_scores)
+    tb.writer.flush()
+    tb.close()
 
 if __name__ == "__main__":
     parser = get_eval_parser()
+    parser.add_argument("--save_failed", action="store_true", default=False, help="Save failed episodes")
     args = parser.parse_args()
-    eval_forewarn(args)
+
+    if args.log_name is None: args.log_name = "none"
+    args.eval_log_dir = os.path.join(args.model_folder, args.log_name)
+    os.makedirs(args.eval_log_dir, exist_ok=True)
+
+    with open(os.path.join(args.eval_log_dir, "eval_config.yaml"), "w") as fp:
+        yaml.dump(args.__dict__, fp)
+
+    _eval(args)

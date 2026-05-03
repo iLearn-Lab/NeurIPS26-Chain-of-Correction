@@ -1,0 +1,73 @@
+training:
+  seed: 0
+  epochs: 200
+  batch_size: 96
+  save_every_x_epoch: 10
+  encoder_lr: 0.0001
+  predictor_lr: 0.0005
+  action_encoder_lr: 0.0005
+img_size: 224
+frameskip: 1
+train_data_path: /data/colosseum_dataset/lpb_data/turn_oven_on_data/turn_oven_on_demo.hdf5
+val_data_path: /data/colosseum_dataset/lpb_data/turn_oven_on_data/turn_oven_on_demo.hdf5
+view_names:
+- cam_front_view_image
+- cam_wrist_view_image
+original_img_size: 256
+cropped_img_size: 224
+action_emb_dim: 64
+proprio_emb_dim: 64
+policy_ckpt_path: null
+use_layernorm: true
+use_crop: true
+abs_action: true
+normalize_action: true
+num_hist: 1
+num_pred: 1
+has_predictor: true
+use_pretrained_encoder: false
+encoder_ckpt_path: null
+predictor_ckpt_path: null
+model:
+  _target_: dyn_model.models.visual_dyn_model.VisualDynamicsModel
+  image_size: 224
+  num_hist: 1
+  num_pred: 1
+  train_encoder: false
+  train_predictor: false
+debug: false
+env:
+  name: colosseum_turn_oven_on
+  dataset_class: dyn_model.datasets.robomimic_dset.RobomimicImageDynamicsModelDataset
+  train_data_path: /data/colosseum_dataset/lpb_data/turn_oven_on_data/turn_oven_on_demo.hdf5
+  val_data_path: /data/colosseum_dataset/lpb_data/turn_oven_on_data/turn_oven_on_demo.hdf5
+  view_names:
+  - cam_front_view_image
+  - cam_wrist_view_image
+  action_dim: 8
+  proprio_dim: 8
+  original_img_size: 256
+  cropped_img_size: 224
+  proprio_emb_dim: 64
+  action_emb_dim: 64
+  policy_ckpt_path: null
+  shape_obs:
+    state:
+      shape:
+      - 8
+    cam_front_view_image:
+      shape:
+      - 3
+      - 256
+      - 256
+      type: rgb
+    cam_wrist_view_image:
+      shape:
+      - 3
+      - 256
+      - 256
+      type: rgb
+saved_folder: /home/zxn/Chain-of-Correction/policy/BridgeVLA/finetune/Colosseum
+effective_batch_size: 96
+gpu_batch_size: 96
+wandb_run_id: odnuhx60

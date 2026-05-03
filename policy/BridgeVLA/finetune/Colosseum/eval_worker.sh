@@ -1,9 +1,24 @@
 #!/bin/bash
-# bash /home/zxn/Chain-of-Correction/policy/BridgeVLA/finetune/Colosseum/eval_worker.sh "vlm_debug" 80 "/home/zxn/Chain-of-Correction/policy/BridgeVLA/checkpoints/COLOSSEUM" 4 "setup_chess"
+# ==============================================================================
+# Script: eval_worker.sh
+# Purpose: Launches a headless evaluation worker for the Chain-of-Correction (CoC)
+#          framework within the CoppeliaSim/Colosseum environment.
+# 
+# Usage:
+#   bash eval_worker.sh <trial> <epoch> <model_folder> <gpu_id> <task_list_str>
+#
+# Arguments:
+#   trial         : Identifier for the current trial run (e.g., "trial1", "vlm_debug")
+#   epoch         : The epoch number of the model checkpoint being evaluated.
+#   model_folder  : Root directory containing the trained model checkpoints.
+#   gpu_id        : Target GPU ID to allocate for this specific worker.
+#   task_list_str : A space-separated string of root tasks to evaluate 
+#                   (e.g., "setup_chess scoop_with_spatula").
+# ==============================================================================
 cd /home/zxn/Chain-of-Correction/policy/BridgeVLA/finetune
 
 # ==========================================
-# 1. 基础环境补丁 (最纯净版)
+# 1. Base Environment & Rendering Patches
 # ==========================================
 export COPPELIASIM_ROOT=$(pwd)/CoppeliaSim_Edu_V4_1_0_Ubuntu20_04 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$COPPELIASIM_ROOT
@@ -18,7 +33,7 @@ export TF_CPP_MIN_LOG_LEVEL=3
 export GALLIUM_DRIVER=softpipe
 
 # ==========================================
-# 2. 接收外部参数
+# 2. Argument Parsing & Paths Definition
 # ==========================================
 export DEMO_PATH_ROOT=/data/colosseum_dataset/test
 export eval_root_dir=opensource_colosseum
@@ -34,7 +49,7 @@ export CUDA_VISIBLE_DEVICES=$gpu_id
 cd Colosseum
 
 # ==========================================
-# 3. 核心评估循环 (任务 -> 变体)
+# 3. Core Evaluation Loop (Tasks & Variations)
 # ==========================================
 for root_task in $task_list_str; do
     export DEMO_PATH=$DEMO_PATH_ROOT/$root_task
@@ -47,28 +62,31 @@ for root_task in $task_list_str; do
         export DATA_PATH=$DEMO_PATH/$task_list/
 
         if [ ! -d "$DATA_PATH" ]; then
-            echo "⏭️  [GPU $gpu_id] 任务 $root_task 的 Variation $current_var 不存在，自动跳过。"
+            echo "[GPU $gpu_id] Variation $current_var for task $root_task does not exist. Skipping."
             continue
         fi    
 
         # ==========================================================
+        # Dynamic Directory Structure Patch
+        # ==========================================================
+        # Fixes missing 'variation0' hierarchies in legacy dataset formats
         if [ ! -d "$DATA_PATH/variation0" ] && [ -d "$DATA_PATH/episodes" ]; then
-            echo "🔧 检测到异常目录结构 ($task_list 缺少 variation0)，正在动态修复..."
+            echo "[Notice] Detected anomalous directory structure ($task_list is missing variation0). Applying dynamic patch..."
             
-            # 1. 创建缺失的 variation0 文件夹
+            # 1. Create the missing variation0 directory
             mkdir -p "$DATA_PATH/variation0"
             
-            # 2. 把 episodes 整个文件夹移进去
+            # 2. Move the entire episodes folder inside variation0
             mv "$DATA_PATH/episodes" "$DATA_PATH/variation0/"
             
-            # 3. 提取 variation_descriptions.pkl 到 variation0 根目录（匹配标准格式）
-            # 寻找任意一个 episode 里的 variation_descriptions.pkl 并复制出来
+            # 3. Extract variation_descriptions.pkl to the variation0 root (to match standard format)
+            # Search for variation_descriptions.pkl in any episode and copy it out
             pkl_file=$(find "$DATA_PATH/variation0/episodes" -name "variation_descriptions.pkl" | head -n 1)
             if [ -n "$pkl_file" ]; then
                 cp "$pkl_file" "$DATA_PATH/variation0/"
-                echo "✅ 修复完成！已补齐 variation0 层级并提取 pkl 文件。"
+                echo "[Success] Patch complete. Reconstructed variation0 hierarchy and extracted pkl file."
             else
-                echo "⚠️ 警告：未在 episode 中找到 variation_descriptions.pkl，可能会影响评测。"
+                echo "[Warning] variation_descriptions.pkl not found in episode. This may affect evaluation."
             fi
         fi
         # ==========================================================
@@ -79,11 +97,11 @@ for root_task in $task_list_str; do
     export eval_dir=$eval_root_dir/epoch_${epoch}_trial_${trial}/all_vars/$root_task/
 
     echo "=========================================================="
-    echo "🚀 [GPU $gpu_id] 开始测试: $ALL_TASKS" # $root_task | Variation: $current_var
+    echo "[GPU $gpu_id] Initiating simulation rollout for: $ALL_TASKS" 
     echo "=========================================================="
     export PYTHONPATH=/home/zxn/Chain-of-Correction:$PYTHONPATH
  
-    xvfb-run --auto-servernum --server-args='-screen 0 1024x768x24 -ac +extension GLX +render -noreset' \
+    xvfb-run --server-num=20$gpu_id --auto-servernum --server-args='-screen 0 1024x768x24 -ac +extension GLX +render -noreset' \
         python3 eval.py \
         --model-folder $model_folder  \
         --eval-datafolder $DEMO_PATH \

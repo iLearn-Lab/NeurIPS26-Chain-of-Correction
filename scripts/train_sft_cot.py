@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""SFT-only training script for CoT trajectories.
+"""
+SFT Trajectory Training Script for Multimodal CoT.
 
-Launch with:  
+Optimized for Qwen2.5-VL-3B/7B. This script bridges structured JSON 
+trajectories (Perception -> Logic -> Action) into a format compatible 
+with the native Qwen Vision-Language Processor.
+
+Usage:
     PYTHONPATH=. CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
         --nproc_per_node=4 \
         --master_port=29516 \
         scripts/train_sft_cot.py \
         --config configs/sft_config.yaml \
-        --data-path /data/colosseum_dataset/mixed_sft_v1_0.2_cleaned.json \
-        --output-dir /data/colosseum_dataset/checkpoints/sft/v1_oversample \
-        --run-name corl-mixed-expert-failure-0.2-oversample
+        --data-path /data/colosseum_dataset/mixed_sft_v1.json \
+        --output-dir /data/checkpoints/sft/v1 \
+        --run-name corl-production-sft
 """
 
 import argparse
@@ -35,27 +40,30 @@ logging.basicConfig(
 logger = logging.getLogger("corl.sft_train")
 
 # =========================================================================
-# 1. 桥接解析器：将多模态 CoT JSON 格式无缝转译给 SFTTrainer
+# 1. Dataset Adapter: Bridging CoT JSON to VLM Vision Blocks
 # =========================================================================
 class CoRLQwenDataset(Dataset):
-    """Wrapper to adapt the multi-turn CoT JSON format to the SFTTrainer."""
+    """
+    Adapter to convert multi-turn CoT JSON files into structured VLM inputs.
+    
+    Transforms raw text containing <image> placeholders into standard 
+    Qwen2.5-VL Vision Blocks with local file protocol support.
+    """
     def __init__(self, data_path_str):
         self.data = []
         loaded_files_count = 0
-        
-        # 支持通过逗号分隔传入多个路径
+         
         paths = [p.strip() for p in data_path_str.split(',') if p.strip()]
         
         for path in paths:
             if os.path.isdir(path):
-                # 如果传入的是目录，自动寻找该目录下所有的 .json 文件
+                # Recursively discover all JSON files in the directory
                 json_files = glob.glob(os.path.join(path, "*.json"))
                 for json_file in json_files:
                     with open(json_file, 'r', encoding='utf-8') as f:
                         self.data.extend(json.load(f))
                         loaded_files_count += 1
             elif os.path.isfile(path):
-                # 如果传入的是单个文件，直接读取
                 with open(path, 'r', encoding='utf-8') as f:
                     self.data.extend(json.load(f))
                     loaded_files_count += 1
@@ -69,7 +77,7 @@ class CoRLQwenDataset(Dataset):
         
     def __getitem__(self, idx):
         item = self.data[idx]
-        # 深拷贝以防修改原始内存中的数据
+        # Deep copy to prevent accidental mutation of the in-memory cache
         import copy
         msgs = copy.deepcopy(item["messages"]) 
         image_paths = item.get("image_paths", [])
@@ -77,9 +85,7 @@ class CoRLQwenDataset(Dataset):
         prompt = msgs[:-1]  
         ground_truth = msgs[-1]["content"]  
         
-        # =======================================================
-        # 格式对齐：将最后一个 user 的纯文本转换为 Qwen 官方的 Vision Block 格式
-        # =======================================================
+        # Format Alignment: Inject structured Vision Blocks into the final user turn
         if len(image_paths) > 0:
             last_user_idx = -1
             for i in range(len(prompt) - 1, -1, -1):
@@ -89,18 +95,17 @@ class CoRLQwenDataset(Dataset):
                     
             if last_user_idx != -1:
                 original_text = prompt[last_user_idx]["content"]
-                # 剔除掉纯文本里的 <image> 占位符
+                # Strip raw <image> tags as they will be replaced by structured blocks
                 cleaned_text = original_text.replace("<image>\n", "").replace("<image>", "").lstrip()
-                
-                # 构造成与评测端完全一致的 blocks 列表
+                 
                 blocks = []
                 for img_path in image_paths:
-                    # Qwen2.5-VL 官方支持 'file://' 协议直接读取本地图片
+                    # Qwen2.5-VL utilizes the 'file://' protocol for efficient local image loading
                     blocks.append({"type": "image", "image": f"file://{img_path}"})
                 
                 blocks.append({"type": "text", "text": cleaned_text})
                 
-                # 替换为结构化内容
+                # Replace string content with the structured multimodal block list
                 prompt[last_user_idx]["content"] = blocks
         
         return {
@@ -110,7 +115,7 @@ class CoRLQwenDataset(Dataset):
         }
 
 # =========================================================================
-# 2. SFT 主训练逻辑
+# 2. Main Training Orchestration
 # =========================================================================
 def main():
     parser = argparse.ArgumentParser(description="CoRL SFT-Only Training")
@@ -118,6 +123,7 @@ def main():
     parser.add_argument("--data-path", type=str, required=True, help="Comma-separated list of paths to JSON files or directories")
     parser.add_argument("--output-dir", type=str, default="./outputs_sft", help="Output directory")
     parser.add_argument("--run-name", type=str, default="corl-3b-sft-cot", help="WandB run name for this experiment")
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None, help="Path to checkpoint or 'True' to find latest")
     args = parser.parse_args()
 
     from configs.base_config import ProductionConfig
@@ -174,12 +180,9 @@ def main():
     if is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ----------------------------------------------------------------
-    # 注入 JSON 数据集并开启 SFT
-    # ----------------------------------------------------------------
+    # Initialize Dataset and Trainer
     logger.info("=== Starting SFT Training on CoT Data ===")
-    
-    # 动态加载你的 JSON (支持多目录/多文件合并)
+     
     sft_dataset = CoRLQwenDataset(args.data_path)
     logger.info("[Rank %d] Ready to train on %d samples.", rank, len(sft_dataset))
     
@@ -190,7 +193,8 @@ def main():
         output_dir=str(output_dir)
     )
     
-    sft_checkpoint = sft_trainer.train()
+    # sft_checkpoint = sft_trainer.train()
+    sft_checkpoint = sft_trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     logger.info("SFT complete. Checkpoint: %s", sft_checkpoint)
 
     # Cleanup

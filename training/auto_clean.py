@@ -2,33 +2,46 @@ import os
 import time
 import shutil
 
-# 替换成你的真实输出路径
+# ==========================================
+# Configuration
+# ==========================================
+# Path to the directory where training checkpoints are stored
 CHECKPOINT_DIR = "/data/colosseum_dataset/checkpoints/sft/v1_oversample"
-KEEP_LATEST_N = 2  # 只保留最新的 2 个 step checkpoint
 
-print(f"🧹 开始后台巡逻清理: {CHECKPOINT_DIR}")
+# Number of most recent step-based checkpoints to preserve
+KEEP_LATEST_N = 2
+
+# Interval between cleanup cycles (1800 seconds = 30 minutes)
+CLEANUP_INTERVAL = 1800
+
+print(f"[Monitor] Starting background checkpoint cleanup for: {CHECKPOINT_DIR}")
 
 while True:
     if os.path.exists(CHECKPOINT_DIR):
-        # 1. 找出所有以 'checkpoint-' 开头，并且后面全都是数字的文件夹 (排除 epoch 和 final)
+        # 1. Identify valid step-based checkpoints
+        # Filters for folders matching 'checkpoint-<step>' while ignoring 'epoch-' or 'final' folders
         step_ckpts = []
         for name in os.listdir(CHECKPOINT_DIR):
-            if name.startswith("checkpoint-") and name.split("-")[1].isdigit():
+            parts = name.split("-")
+            if name.startswith("checkpoint-") and len(parts) > 1 and parts[1].isdigit():
                 step_ckpts.append(name)
         
-        # 2. 按步数大小排序
+        # 2. Sort checkpoints by step number in ascending order
         step_ckpts.sort(key=lambda x: int(x.split("-")[1]))
         
-        # 3. 如果数量超过保留上限，开始删！
+        # 3. Prune older checkpoints if count exceeds the retention limit
         if len(step_ckpts) > KEEP_LATEST_N:
+            # Select all but the latest N checkpoints for deletion
             to_delete = step_ckpts[:-KEEP_LATEST_N]
+            
             for ckpt in to_delete:
                 ckpt_path = os.path.join(CHECKPOINT_DIR, ckpt)
                 try:
                     shutil.rmtree(ckpt_path)
-                    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 🗑️ 已删除过期检查点: {ckpt}")
+                    timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"[{timestamp}] Successfully removed stale checkpoint: {ckpt}")
                 except Exception as e:
-                    print(f"删除 {ckpt} 失败: {e}")
+                    print(f"[Error] Failed to delete {ckpt}: {e}")
                     
-    # 每 30 分钟 (1800 秒) 醒来检查一次
-    time.sleep(1800)
+    # Suspend execution until the next cleanup cycle
+    time.sleep(CLEANUP_INTERVAL)

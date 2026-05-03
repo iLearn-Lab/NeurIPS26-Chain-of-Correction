@@ -7,16 +7,16 @@ model:
 data:
   root_path: "/data/colosseum_dataset/expert"
   sft_split: "expert"
-  sft_max_samples: 50000
-  num_workers: 8           # 每个 DDP 进程开启 8 个线程读图
-  prefetch_factor: 2       # 预加载 2 倍的数据到内存
+  sft_max_samples: 600000  # 50000
+  num_workers: 8           # Data loading threads per DDP process
+  prefetch_factor: 2       # Prefetch 2x samples into memory buffer
 
 training:
-  max_grad_norm: 1.0       # 梯度剪裁阈值
+  max_grad_norm: 1.0       # Gradient clipping threshold
   sft:
     epochs: 4
-    # max_steps: 10000       # 训练总步数
-    batch_size: 1          # 每张 A100 放 1 个样本 (取决于显存)
-    learning_rate: 2e-5    # 初始学习率
-    warmup_steps: 1500      # 预热步数
-    grad_accumulation_steps: 32  # 总 Batch Size = 8 * 1 * 32 = 256
+    # max_steps: 10000       # Total training steps
+    batch_size: 1          # Samples per GPU (VRAM dependent)
+    learning_rate: 2e-5    # Initial learning rate
+    warmup_steps: 1500      # Learning rate warmup steps
+    grad_accumulation_steps: 32  # Global batch size = 8 GPUs * 1 bs * 32 acc = 256

@@ -44,7 +44,7 @@ class RolloutGenerator(object):
         else:
             obs = env.reset()
         agent.reset()
-        if vlm_corrector is not None:  # 在 Episode 开始前，清空纠错大模型的历史记忆
+        if vlm_corrector is not None:
             vlm_corrector.reset_memory()
         obs_history = {k: [np.array(v, dtype=self._get_type(v))] * timesteps for k, v in obs.items()}
         for step in range(episode_length):
@@ -62,8 +62,7 @@ class RolloutGenerator(object):
                     return
                 act_result = ActResult(actions[step])
             # =========================================================
-            if vlm_corrector is not None:
-                # 从当前的 obs 字典里提取出 4 张多视角图片 
+            if vlm_corrector is not None: 
                 current_images = [
                     obs.get('front_rgb'), 
                     obs.get('left_shoulder_rgb'), 
@@ -72,9 +71,8 @@ class RolloutGenerator(object):
                 ] 
                 current_images = [img for img in current_images if img is not None] 
                 if len(current_images) > 0:
-                    base_proposal = act_result.action  # 拿到基础策略的动作 
-                    print(f"Step {step}: Original action = {base_proposal[:8]}")
-                    # VLM 给出评估和修正
+                    base_proposal = act_result.action  
+                    print(f"Step {step}: Original action = {base_proposal[:8]}") 
                     corrected_action, is_correction_needed = vlm_corrector.step(
                         current_images=current_images, 
                         base_policy_proposal=base_proposal, 
@@ -84,9 +82,9 @@ class RolloutGenerator(object):
  
                     if is_correction_needed:
                         act_result.action = np.array(corrected_action, dtype=act_result.action.dtype)
-                        print(f"   => ⚠️ VLM Intervention: Action Overwritten!")
+                        print(f"   => VLM Intervention: Action Overwritten!")
                     else:
-                        print(f"   => ✅ VLM Pass: Bypassing correction, maintaining float64 precision.")
+                        print(f"   => VLM Pass: Bypassing correction, maintaining float64 precision.")
             # =========================================================
             # Convert to np if not already
             agent_obs_elems = {k: np.array(v) for k, v in

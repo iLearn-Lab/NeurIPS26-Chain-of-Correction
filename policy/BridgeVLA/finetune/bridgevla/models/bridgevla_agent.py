@@ -415,6 +415,7 @@ class RVTAgent:
         rot_ver: int = 0,
         rot_x_y_aug: int = 2,
         log_dir="",
+        **kwargs
     ):
         self._network = network
         self._num_rotation_classes = num_rotation_classes
@@ -453,9 +454,9 @@ class RVTAgent:
 
         self.num_all_rot = self._num_rotation_classes * 3
 
-        self.use_stable_bc = False
-        self.stable_lambda = 0.1
-        self.stable_k = -0.5
+        self.use_stable_bc = kwargs.get("use_stable_bc", False)
+        self.stable_lambda = kwargs.get("stable_lambda", 0.01)
+        self.stable_k = kwargs.get("stable_k", -0.5)
 
         # --- Forewarn-style Sampling Parameters (Hardcoded) ---
         self.use_sampling = False      
@@ -659,10 +660,27 @@ class RVTAgent:
 
             wpt_local = torch.cat(wpt_local, axis=0)
 
+            # Implements Heuristic Attractor Behavioral Cloning (HA-BC): a = a* + K(s - s*).
+            # Using local deviation as a proxy for state shift to create a basin of attraction.
+            pc_ori = pc 
+
             if self.use_stable_bc and backprop:
-                # Implements Stable-BC contractive target: a = a* + K(s - s*).
-                # Using local deviation as a proxy for state shift to create a basin of attraction.
-                delta_x = wpt_local.clone() 
+                current_ee_pose = replay_sample["gripper_pose"][:, 0, 0:3] 
+                
+                current_ee_local = []
+                for _pc_ori, _ee in zip(pc_ori, current_ee_pose):
+                     _ee_local, _ = mvt_utils.place_pc_in_cube(
+                         _pc_ori, 
+                         app_pc=_ee, 
+                         with_mean_or_bounds=self._place_with_mean,
+                         scene_bounds=None if self._place_with_mean else self.scene_bounds,
+                     )
+                     current_ee_local.append(_ee_local.unsqueeze(0))
+                current_ee_local = torch.cat(current_ee_local, axis=0)
+
+                delta_x = current_ee_local - wpt_local 
+                
+                # HA-BC  Target_new = a* + K * (s - a*)
                 stable_target_coord = wpt_local + self.stable_k * delta_x
             else:
                 stable_target_coord = wpt_local
@@ -805,6 +823,7 @@ class RVTAgent:
                 "rot_loss_z": rot_loss_z.item(),
                 "grip_loss": grip_loss.item(),
                 "collision_loss": collision_loss.item(),
+                "stable_loss": stable_loss.item(),
                 "lr": self._optimizer.param_groups[0]["lr"],
             }
             manage_loss_log(self, loss_log, reset_log=reset_log)

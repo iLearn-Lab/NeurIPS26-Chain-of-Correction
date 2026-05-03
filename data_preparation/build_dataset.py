@@ -532,7 +532,7 @@ class UnifiedMultiTurnCoTFormatter:
             print(f"  ├─ Vector: {[round(v, 6) for v in (corrected_pos - curr_pos)]}")
             print(f"  └─ Gripper: {policy_action[7]} -> {corrected_gripper}")
             _counts[b_type] = current_count + 1
-            if current_count + 1 == 3: print(f"  🔇 [{b_type}] Logs muted...")
+            if current_count + 1 == 3: print(f"  [{b_type}] Logs muted...")
 
         corrected_action = np.concatenate([corrected_pos, corrected_quat, [corrected_gripper]])
         return [round(float(v), 6) for v in corrected_action]
@@ -772,7 +772,7 @@ def process_failed_rollouts_to_qwen(task_name, base_dataset_path, output_dir=Non
   
             policy_action = obs_dict.get('action', None)
             if policy_action is not None:
-                policy_action = [round(float(v), 4) for v in policy_action][:8] # 取前8维 
+                policy_action = [round(float(v), 4) for v in policy_action][:8] 
 
             episode_data.append({
                 "momagraph": curr_graph, 

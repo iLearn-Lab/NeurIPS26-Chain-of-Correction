@@ -50,7 +50,7 @@ def save_failed_episode(transitions, task_name, variation, episode_id, descripti
             low_dim_obs_list.append(obs_copy)
             
         except Exception as e:
-            print(f"❌ [Frame {step_idx}] 解析出错: {e}")
+            print(f"[Frame {step_idx}] failed: {e}")
 
     try:
         with open(os.path.join(ep_dir, "low_dim_obs.pkl"), "wb") as f:
@@ -60,6 +60,6 @@ def save_failed_episode(transitions, task_name, variation, episode_id, descripti
         with open(os.path.join(ep_dir, "variation_descriptions.pkl"), "wb") as f:
             pickle.dump(descriptions, f)
         np.save(os.path.join(ep_dir, "actions.npy"), np.array(actions_list))
-        print(f"📸 [Failure Captured] 成功写入 {len(low_dim_obs_list)} 帧 (含动作) 到: {ep_dir}")
+        print(f" [Failure Captured] {len(low_dim_obs_list)} frames written into: {ep_dir}")
     except Exception as e:
-        print(f"❌ 文件写入失败: {e}")
+        print(f"Writing failure: {e}")
