@@ -58,7 +58,6 @@ Imitation learning policies can accumulate small execution errors into task fail
 ## 📊 Experimental Results
 
 ### Results on THE COLOSSEUM
-Cortical Policy outperforms SOTA view transformers across 18 diverse manipulation tasks.
 
 | Method | Reference | Avg. Success ↑ | All Perturbations ↑ | MO Color ↑ | Light Color ↑ | Distractor Objects ↑ | MO Size ↑ |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
